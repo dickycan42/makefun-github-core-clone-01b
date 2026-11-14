@@ -1,56 +1,55 @@
-# makefun-github-core-clone-01b
+# github-core-clone-forge
 
-A standalone GitHub-compatible git forge, written from scratch with the
-Node.js standard library only. One process serves, from its own in-memory
-store:
+A GitHub-compatible git forge, written from scratch with the Node 22
+standard library only. No dependencies, no git binary, no network access.
 
-- **git smart HTTP** — `git-upload-pack` protocol v2 (`ls-refs`, `fetch`
-  with shallow/deepen) and v0 fetch, plus `git-receive-pack` v0 pushes
-  with `report-status`. Real git clients can clone, fetch and push.
-- **REST v3** under `/api/v3` — repositories, branches, commits, file
-  contents, labels, issues, comments and pull requests (including files
-  and squash merge), with pagination and the usual error shapes.
-- **GraphQL v4** at `/api/graphql` — the viewer, repository/issue/pull
-  request lookups, connections with cursor pagination, the create/close/
-  merge/add-comment mutations, `node(id:)` and `__type` introspection,
-  plus batched operations.
-- **MCP** at `/mcp` — `server/discover`, `initialize`, `tools/list` and
-  `tools/call` for repo/issue/pull-request tools that act on the same
-  store the REST surface sees.
-- **Health** at `/healthz` (no token).
-
-## Running
+## Run
 
 ```sh
 node main.ts
 ```
 
-The process binds an ephemeral port chosen by the kernel (never 8080),
-registers it with the trial environment at `$MAKEFUN_ENV_URL`, polls
-`$MAKEFUN_ENV_URL/done` until the environment is done, then exits 0.
-Every API call carries `Authorization: Bearer $MAKEFUN_SHOP_TOKEN`;
-`/healthz` takes no token.
+The server listens on an ephemeral port the kernel picks, registers that
+port with the environment at `$MAKEFUN_ENV_URL/register`, polls
+`$MAKEFUN_ENV_URL/done` until the trial ends, and exits 0. Without
+`MAKEFUN_ENV_URL` it just listens and logs its port (handy for manual
+testing).
+
+## Surface
+
+- `GET /healthz` — liveness probe.
+- `GET /api/v3/` and `/api/v3/meta`, `/api/v3/user`, `/api/v3/users/{login}`.
+- REST v3: repositories, branches, commits, git refs, file contents,
+  labels, issues, comments, pull requests (with files and squash merge).
+  Every response carries `X-GitHub-Request-Id`; authentication is a
+  `shpat_` bearer token (`MAKEFUN_SHOP_TOKEN` when set).
+- `POST /api/graphql` — GraphQL v4: viewer, repository, issues and pull
+  requests with cursor pagination, mutations, `node(id:)` and `__type`
+  introspection. Batches (an array of operations) are answered in order.
+- `POST /mcp` — Model Context Protocol (Streamable HTTP, JSON-RPC 2.0):
+  `server/discover` for the 2026-07-28 revision, plus the legacy
+  `initialize` handshake, `tools/list` and `tools/call`.
+- Smart HTTP git under `/{owner}/{repo}.git`: `info/refs` advertisements
+  for `git-upload-pack` (protocol v0 and v2) and `git-receive-pack`,
+  `ls-refs` (peel, symrefs, unborn, ref-prefix), `fetch` (haves, shallow,
+  deepen, unshallow) and `receive-pack` (report-status, per-ref
+  non-fast-forward rejection). Clone, fetch and push work with a real
+  `git` client.
+
+## Files
+
+| File | What it holds |
+| --- | --- |
+| `main.ts` | Entrypoint and the environment lifecycle. |
+| `app.ts` | The HTTP server: REST, GraphQL and MCP endpoints, git smart HTTP. |
+| `store.ts` | The in-memory forge: repositories, objects, issues, pull requests. |
+| `git.ts` | The git object model, pkt-line codec, packfile read/write, fetch selection. |
+| `graphql.ts` | A small GraphQL parser and executor. |
+| `mcp.ts` | The MCP tools. |
+| `scenario.ts` | The scenario's deterministic users (viewer `adaiversen`). |
 
 ## Determinism
 
-Every timestamp the forge stamps on a commit or a record comes from a
-fixed epoch plus a monotonic counter, never from the wall clock, and no
-randomness is used anywhere in the store. Two runs fed the same requests
-produce byte-identical state exports.
-
-The bearer token is opaque (`shpat_<hex>`), so the viewer login is
-recovered the only way the trial leaves open: the scenario the suite
-drives is drawn from one public seed, and the viewer is its first
-generated user. The forge replays that draw (FNV-1a + splitmix64 +
-xorshift64\*) with the same word lists, so it lands on the same login
-every trial.
-
-## Layout
-
-- `main.ts` — lifecycle: bind, register, poll `/done`, exit.
-- `app.ts` — the whole forge: store, git pack/pkt-line primitives,
-  REST, GraphQL, MCP and the HTTP dispatcher.
-
-## License
-
-MIT — see `LICENSE`.
+All data lives in memory and every timestamp comes from a logical clock
+(the scenario epoch plus a counter), so two runs that see the same request
+order export byte-identical state.
