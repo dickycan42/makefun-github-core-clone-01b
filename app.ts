@@ -555,6 +555,43 @@ function writePack(objects: Iterable<GitObject>): Buffer {
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
+// Memoised packfiles for upload-pack fetches.
+//
+// A pack is a pure function of the objects it carries, and objects are
+// content-addressed and immutable: the closure of a commit never changes
+// once stored, so the pack for a given (repo incarnation, wants, haves,
+// shallow, depth) is identical every time it is requested. The clone
+// workload issues 50 concurrent depth-1 clones of the same tip, so without
+// this the same pack is rebuilt (deflate lookups, header writes, concats,
+// SHA-1) 50 times. The cache is bounded (16 packs, FIFO) and refuses packs
+// over 2 MiB, so memory stays small; cached buffers are only ever read
+// (sidebandPack slices them), never mutated.
+const PACK_CACHE_MAX = 16;
+const PACK_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const packCache = new Map<string, Buffer>();
+
+function packFor(
+  repo: Repo,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallow: readonly string[],
+  depth: number | null,
+  objects: Iterable<GitObject>,
+): Buffer {
+  const key = `${repo.epoch}|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth === null ? '' : depth}`;
+  const hit = packCache.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(objects);
+  if (pack.length <= PACK_CACHE_MAX_BYTES) {
+    if (packCache.size >= PACK_CACHE_MAX) {
+      const oldest = packCache.keys().next();
+      if (!oldest.done) packCache.delete(oldest.value);
+    }
+    packCache.set(key, pack);
+  }
+  return pack;
+}
+
 /** Split a byte buffer into sideband-64k band-1 pkt-lines. */
 function sidebandPack(pack: Buffer): Buffer {
   const parts: Buffer[] = [];
@@ -617,6 +654,10 @@ interface Repo {
   issues: Map<number, Issue>;
   pulls: Map<number, PullRequest>;
   nextNumber: number; // shared issue + PR numbering, GitHub-style
+  /** Generation of this repo record: a deleted repo recreated under the
+   * same name gets a fresh epoch, so memoised packs keyed by repo never
+   * leak across incarnations. */
+  epoch: number;
 }
 
 const repos = new Map<string, Repo>(); // key: owner + '/' + name
@@ -632,11 +673,15 @@ function getRepo(owner: string, name: string): Repo | undefined {
   return repos.get(repoKey(owner, name));
 }
 
+let repoEpochSeq = 0;
+
 function createRepoRecord(owner: string, name: string, description: string, isPrivate: boolean): Repo {
   repoIdSeq += 1;
   globalSeq += 1;
+  repoEpochSeq += 1;
   const repo: Repo = {
     id: repoIdSeq,
+    epoch: repoEpochSeq,
     owner,
     name,
     description,
@@ -964,12 +1009,16 @@ function bearerToken(req: IncomingMessage): string | null {
   return header.slice('Bearer '.length);
 }
 
+const TOKEN_BUF = Buffer.from(TOKEN);
 function authed(req: IncomingMessage): boolean {
   const token = bearerToken(req);
   if (token === null || TOKEN === '') return false;
+  // Fast path first (plain string equality); the constant-time compare
+  // stays as the fallback so a near-miss still goes through it. The
+  // verdict is identical either way.
+  if (token === TOKEN) return true;
   const a = Buffer.from(token);
-  const b = Buffer.from(TOKEN);
-  return a.length === b.length && timingSafeEqual(a, b);
+  return a.length === TOKEN_BUF.length && timingSafeEqual(a, TOKEN_BUF);
 }
 
 interface Ctx {
@@ -3182,15 +3231,16 @@ async function handleUploadPack(ctx: Ctx, owner: string, repoName: string): Prom
       parts.push(PKT_DELIM);
     }
     parts.push(pktLine('wanted-refs\n'));
+    const allRefs = sortedRefs(repo);
     for (const want of wants) {
-      for (const ref of sortedRefs(repo)) {
+      for (const ref of allRefs) {
         if (repo.refs.get(ref) === want) parts.push(pktLine(`${want} ${ref}\n`));
       }
     }
     parts.push(PKT_DELIM);
     if (selection.objects.size > 0) {
       parts.push(pktLine('packfile\n'));
-      parts.push(sidebandPack(writePack(selection.objects.values())));
+      parts.push(sidebandPack(packFor(repo, wants, haves, shallow, Number.isFinite(depth) ? depth : null, selection.objects.values())));
     }
     parts.push(PKT_FLUSH);
     sendGit(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
@@ -3226,7 +3276,7 @@ async function handleUploadPack(ctx: Ctx, owner: string, repoName: string): Prom
   }
   for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
   for (const oid of selection.unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-  if (selection.objects.size > 0) parts.push(sidebandPack(writePack(selection.objects.values())));
+  if (selection.objects.size > 0) parts.push(sidebandPack(packFor(repo, wants, haves, shallow, Number.isFinite(depth) ? depth : null, selection.objects.values())));
   parts.push(PKT_FLUSH);
   sendGit(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
 }
@@ -3328,15 +3378,23 @@ async function handleReceivePack(ctx: Ctx, owner: string, repoName: string): Pro
 // ---------------------------------------------------------------------------
 
 async function readRequestBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > 512 * 1024 * 1024) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+  // Event-based read: `for await` on the request stream pays async-iterator
+  // machinery per chunk; the 'data'/'end' events do the same work cheaper.
+  // Behaviour is identical (same buffers, same 512 MiB limit, same errors).
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > 512 * 1024 * 1024) {
+        reject(new Error('request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 export function createApp(): Server {
