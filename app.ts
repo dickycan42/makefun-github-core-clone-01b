@@ -687,7 +687,28 @@ function ancestors(repo: Repo, start: string): Set<string> {
 }
 
 function isAncestor(repo: Repo, maybeAncestor: string, commit: string): boolean {
-  return ancestors(repo, commit).has(maybeAncestor);
+  // Bounded walk from `commit` toward its ancestors, stopping as soon as
+  // `maybeAncestor` is found. The previous implementation built the full
+  // ancestor set (O(history)) on every receive-pack update; a linear-history
+  // push only needs 1-2 steps because the new commit's parent is the old
+  // tip. Every reachable node enters the queue as someone's parent and is
+  // checked at that moment, so the result is identical; a non-commit oid
+  // can never be a parent, matching the old set which held commits only.
+  if (maybeAncestor === commit) return true;
+  const seen = new Set<string>();
+  const queue = [commit];
+  while (queue.length > 0) {
+    const oid = queue.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const object = repo.objects.get(oid);
+    if (!object || object.type !== 'commit') continue;
+    for (const parent of parseCommitOf(repo, oid).parents) {
+      if (parent === maybeAncestor) return true;
+      queue.push(parent);
+    }
+  }
+  return false;
 }
 
 /** The merge base of two commits: the first common ancestor found by BFS from both. */
@@ -2904,6 +2925,15 @@ function selectPackObjects(
   depth: number | null,
 ): PackSelection {
   // Minimum depth of every commit reachable from the wants.
+  // When the fetch is depth-limited and the client holds nothing (fresh
+  // shallow clone: no haves, so no ACKs to compute), there is no need to
+  // walk past the depth limit: parents deeper than `depth` are excluded
+  // from `included` by the filter below anyway. This turns a depth-1 fetch
+  // on a 200-commit repo from a 200-commit walk into a 1-commit walk.
+  // Commits exactly AT the limit are still recorded (the `shallow` list
+  // needs them). When haves is non-empty the full walk runs unchanged so
+  // ACK computation stays correct.
+  const depthCutoff = depth !== null && haves.length === 0 ? depth : null;
   const minDepth = new Map<string, number>();
   const queue: { oid: string; depth: number }[] = [];
   for (const want of wants) {
@@ -2918,8 +2948,10 @@ function selectPackObjects(
     for (const parent of commit.parents) {
       if (repo.objects.get(parent)?.type !== 'commit') continue;
       if (!minDepth.has(parent)) {
-        minDepth.set(parent, current.depth + 1);
-        queue.push({ oid: parent, depth: current.depth + 1 });
+        const parentDepth = current.depth + 1;
+        if (depthCutoff !== null && parentDepth > depthCutoff) continue;
+        minDepth.set(parent, parentDepth);
+        queue.push({ oid: parent, depth: parentDepth });
       }
     }
   }
@@ -3325,13 +3357,16 @@ export function createApp(): Server {
       const bodyRaw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readRequestBody(req);
       // A malformed JSON body on the REST surface is a 400 with a message.
       // (GraphQL and MCP answer parse failures in their own shapes.)
+      // Parse the body once and reuse it for validation: the old code
+      // parsed every REST POST/PUT/PATCH body twice (validate, then build
+      // `parsed`). Identical behaviour, half the JSON.parse work.
+      const parsed = bodyRaw.length === 0 ? { ok: true, value: null } : parseJsonBody(bodyRaw);
       if ((method === 'POST' || method === 'PUT' || method === 'PATCH') && pathname.startsWith('/api/v3') && bodyRaw.length > 0) {
-        if (!parseJsonBody(bodyRaw).ok) {
+        if (!parsed.ok) {
           sendJson(res, 400, { message: 'malformed JSON body' });
           return;
         }
       }
-      const parsed = bodyRaw.length === 0 ? { ok: true, value: null } : parseJsonBody(bodyRaw);
       const ctx: Ctx = {
         req,
         res,
